@@ -1,0 +1,647 @@
+---
+title: "Ongo Science data cleaning and feature engineering for user churn modeling"
+author: "Rachel Wehr, PhD; Health Data Science Fellow, Insight"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+```{r}
+library(plyr)
+library(dplyr)
+library(gridExtra)
+library(eeptools)
+library(reshape2)
+library(data.table)
+library(tidyverse)
+library(lubridate)
+require("RPostgreSQL")
+require("sqldf")
+
+```
+
+
+The goal of this is to directly interface with the PostgreSQL database hosted on AWS. This provides up-to-date information about user in-app behavior. 
+
+```{r}
+# Connect to the PostgreSQL database
+# save the password that we can "hide" it as best as we can by collapsing it
+pw <- {
+  "" # add password 
+}
+ 
+# loads the PostgreSQL driver
+drv <- dbDriver("PostgreSQL")
+# creates a connection to the postgres database
+# note that "con" will be used later in each connection to the database
+con <- {
+  dbConnect(drv, dbname = "", # include dbname
+                 host = "", port = 0000, #include host and port number
+                 user = "", password = pw) # include user, and pw from above
+}
+
+#rm(pw) # removes the password
+ 
+# check for the existance of the tables to pull in
+dbExistsTable(con, "User")
+dbExistsTable(con, "UserLog")
+dbExistsTable(con, "DataWorkoutRun")
+dbExistsTable(con, "TrackSessionComplete")
+dbExistsTable(con, "TrackEnrollment")
+dbExistsTable(con, "ProfileTimelineItem")
+dbExistsTable(con, "SubscriptionPlan")
+dbExistsTable(con, "SubscriptionReceipt")
+dbExistsTable(con, "DataActivity")
+
+# be sure to disconnect from connection
+#dbDisconnect(con)
+```
+
+Next step is to set the working directory of choice and to read the tables from the databases in from PostgreSQL
+```{r}
+setwd('') #set the output
+
+# Pull in the tables directly from the PostgreSQL database
+user <- dbReadTable(con, c("User"))
+userLog <- dbReadTable(con, c("UserLog"))
+dwRun <- dbReadTable(con, c("DataWorkoutRun"))
+trackEnrollment <- dbReadTable(con, c("TrackEnrollment"))
+trackSessionComplete <- dbReadTable(con, c("TrackSessionComplete"))
+trackEnrollment <- dbReadTable(con, c("TrackEnrollment"))
+trackComplete <- dbReadTable(con, c("TrackComplete"))
+profTimelineitem <- dbReadTable(con, c("ProfileTimelineItem"))
+subscriptionPlan <- dbReadTable(con, c("SubscriptionPlan")) # gives indication if Monthly or 12 months
+subscription <- dbReadTable(con, c("SubscriptionReceipt")) # can then link to the ID
+dataActivity <- dbReadTable(con, c("DataActivity")) 
+
+#dbDisconnect(con)
+
+```
+
+
+```{r}
+# Pull in USER INFORMATION, including demographics
+user2 <- data.frame("userID" = user$X_id, "birthday" = as.character(user$dateOfBirth), "gender" = user$gender)
+# convert to get the bday in date and extract ages
+temp <- ymd_hms(user2$birthday)
+user2$bday <- as.Date(temp)
+ages <- age_calc(na.omit(user2$bday), units = "years")
+user2$age[!is.na(user2$bday)] <- ages
+
+
+#  ==============
+### The following can be updated to lengthen or shorten the times of interest to investigate
+firstdate <- "2019-08-04" # day of app launch
+lastdate <- "2019-09-24" # this was the last date that I analyzed data for
+minnumdays <- 14 # change to 14 for most analyses, 1 for EDA histogram graphs
+#  ==============
+
+userLog2 <- data.frame("userID" = userLog$user, "logtype" = userLog$type, "date" = as.Date(userLog$createdAt))
+
+# limit only to those between the two date of interest (App launch, and final analysis date)
+userLog2 <- userLog2[which(userLog2$date >= firstdate & userLog2$date <= lastdate),]
+
+# Determine the first login date for each user
+firstLogin <- userLog2 %>%
+    group_by(userID) %>%
+    arrange(date) %>%
+    slice(1L)
+
+userInfoAll <- full_join(user2,firstLogin,by="userID")
+# contains the information ONLY for those that had a login during August
+userInfoUnion <- right_join(user2,firstLogin,by="userID")
+
+
+# ========================================================================================================
+### Engineer data frame with a date for each column, userID row, and # observations for logins
+# ========================================================================================================
+
+#### Create temporary data frame with count of logins by date for each unique user
+  temptable <- count(userLog2, userID, date) # gives count for each available date per user
+  temptable$date <- as.Date(as.character(temptable$date))
+  loginInfo <- dcast(temptable, userID ~ date)
+  loginInfo[is.na(loginInfo)] <- 0
+# combine this with the demographic info
+  loginInfo2 <- right_join(userInfoUnion,loginInfo,by="userID")
+
+  
+# Sum together the login info for the columns with dates for each user for total logins in last month
+  totaldays <- length(which(grepl("20", colnames(loginInfo2))))
+  for (i in 1:length(loginInfo2$userID)){
+    loginInfo2$totalLogins[i] <- sum(loginInfo2[i,8:(7+totaldays)])}
+  
+ # rename first active date for each user
+ names(loginInfo2)[names(loginInfo2) == 'date'] <- 'firstlogindate'
+ # Specify the last date in the dataset to set parameter for time with app and provide columns with # days user has had app
+ lastDate <- max(userLog2$date)
+ loginInfo2$dayswithApp <- age_calc(na.omit(loginInfo2$firstlogindate), as.Date(lastDate), units="days")
+ loginInfo2$dayswithAppNumeric <- as.numeric(loginInfo2$dayswithApp) + 1
+
+```
+
+FEATURE #1: Number of logins during week 1
+The next section Builds on loginInfo7 to determine the user-specific behavior during EACH USER's first seven days with the app.
+```{r}
+
+#### First, we identify which subjects we will include; for the model, we are removing subjects that have 14 days or less of data
+## This is because 1) users of fitness apps do not use the app every day, but might have specific weekly patterns in exercise, and
+## 2) I had only about 52 days of data, so I chose 7 days to train the model, and decided that we need at least one additional week 
+##    for each user to actively predict future behavior.
+ loginInfo7 <- loginInfo2[which(loginInfo2$dayswithAppNumeric > minnumdays),]
+
+# Figuring out the number of logins within the first 7 days & number of days logged in in trial period
+# create a vector that gives the column index for any column name that begins with "20" for "2019-01-01"
+ IndexColumns <- which(grepl("20", colnames(loginInfo7)))
+ allDates <- colnames(loginInfo7[IndexColumns])
+ 
+ # adds 'startvec' to the data frame to tell what column to index into for first login
+ for (i in 1:length(loginInfo7$firstlogindate)){
+      loginInfo7$startvec[i] <- which(allDates == loginInfo7$firstlogindate[i])# true date 1 for user in each row
+      loginInfo7$lastdatevec[i] <- length(allDates) # true last date logged 
+        }
+  # gives the column for the last date in the trial period 
+loginInfo7$endvec <- loginInfo7$startvec + 6 # for 7th day after 1st login
+loginInfo7$startcol <- IndexColumns[loginInfo7$startvec] # gives column for date of 1st login
+loginInfo7$endcol <- IndexColumns[loginInfo7$endvec] # gives column for date of last date in week 1
+loginInfo7$lastdatecol <- IndexColumns[loginInfo7$lastdatevec] # gives column date of last day
+
+
+# gives the number of total login ins for the user's first week
+# also gives the number of active days for the user's first week
+# contains info for logins following week 1 as well to help indicate churn
+for (i in 1:length(loginInfo7$firstlogindate)){
+  mycols <- loginInfo7$startcol[i]:loginInfo7$endcol[i]
+  postwk1cols <- (loginInfo7$endcol[i]+1):(loginInfo7$lastdatecol[i])
+  loginInfo7$NumfirstWeeklogins[i] <- sum(loginInfo7[i, mycols])
+  loginInfo7$Wk1ActiveDays[i] <- rowSums(loginInfo7[i,mycols] != 0)
+  loginInfo7$NumPostwk1Logins[i] = sum(loginInfo7[i, postwk1cols])
+  loginInfo7$Postwk1ActiveDays[i] <- rowSums(loginInfo7[i,postwk1cols] != 0)
+} 
+```
+
+
+I am using the in-app login data engineered above to define our levels of churn. For this analysis, we are defining churn in two ways to build two separate models that will predict churn by two different threshholds. This next section binarizes the first definition of churn, which is an individual who has logged in MORE THAN ONE time following the first seven days. 
+```{r}
+# determine post week 1 churn (churners = 1, those logged in at least twice = 0)
+loginchurners <- which(loginInfo7$NumPostwk1Logins < 2) # index for churners
+# Incorporate into loginInfo7 data frame
+loginInfo7$loginchurnPostwk1 <- 0
+loginInfo7$loginchurnPostwk1[loginchurners] <- 1
+
+
+# Normalize the number of logins to number of dates with app
+loginInfo7$NumPostDays <- loginInfo7$dayswithAppNumeric - 7
+loginInfo7$loginsNormPostDays <- loginInfo7$NumPostwk1Logins/loginInfo7$NumPostDays #
+
+### NEXT: add some information such as what the users DID during their logins 
+  # define power users (likely to be coaches?) those that logged in > 250 times
+  powerUsers <- which(loginInfo7$totalLogins > 250)
+  loginInfo7 <- loginInfo7[-powerUsers,]
+```
+
+FEATURE #2: Number of GPS-enabled runs during week 1
+```{r}
+# Pull the information from the dwRun dataframe above
+dwRun2 <- data.frame("userID" = dwRun$owner, "inORout" = dwRun$type, "track" = dwRun$track, "sessionTitle" = dwRun$sessionTitle, "trackTitle" = dwRun$trackTitle, "date" = as.Date(dwRun$startDate))
+
+# limit only to between specific dates, and those instances that were SOLO runs, NOT included in session/track
+dwRun2 <- dwRun2[which(dwRun2$date >= firstdate & dwRun2$date <= lastdate),] 
+# adding this next step removes any runs that were part of the session/tracks
+dwRun2 <- dwRun2[which(is.na(dwRun2$sessionTitle) == FALSE),]
+dwRun2$occur <- 1
+
+### Quick view of the popularity of tracks and sessions within the last month
+aggregate(occur ~ trackTitle + date, data = dwRun2, sum)
+trackTitleoccurances <- aggregate(occur ~ trackTitle, data = dwRun2, sum)
+trackTitleoccurances[order(trackTitleoccurances$occur, decreasing=TRUE),] # shows popularity of tracks in last month
+trackSessionoccurances <- aggregate(occur ~ sessionTitle, data = dwRun2, sum)
+trackSessionoccurances[order(trackSessionoccurances$occur, decreasing=TRUE),] # shows popularity of tracks in last month
+
+## Looking at if a user tracked a run
+#### Create temporary data frame with count of runs by date for each unique user
+# this is taking the dates from ALL available; not just run dates
+  temptableRUN <- count(dwRun2, userID, date) # gives count for each available date per user
+  temptableRUN$date <- as.Date(as.character(temptableRUN$date))
+  # Cast this into a data frame to count the number of solo runs completed by date for each user
+  dwRun2 <- dcast(temptableRUN, userID ~ date)
+
+# find any dates that are available logins but did NOT have any user runs tracked
+  diffColnames <- setdiff(colnames(loginInfo7), colnames(dwRun2))
+  indexRUNaddDate <- diffColnames[which(grepl("20", diffColnames))]
+  dwRun2$placeholder <- 0
+  # rename any additional date --> will need to update if more than one date
+  names(dwRun2)[names(dwRun2) == "placeholder"] <- indexRUNaddDate
+  dwRun2 <- dwRun2[,order(colnames(dwRun2), decreasing=FALSE)] 
+  dwRun2[is.na(dwRun2)] <- 0
+  
+ # Add first login date from loginInfo7 so that we can calculate the num runs logged in wk1
+ tempdf <- data.frame("userID"=loginInfo7$userID, "firstlogindate"=as.character(as.Date(loginInfo7$firstlogindate)))
+ dwRun3 <-  left_join(dwRun2, tempdf, by = "userID")
+ 
+ # create a vector that gives the column index for any column name that begins with "20" for "2019-01-01"
+ IndexColumnsRUN <- which(grepl("20", colnames(dwRun3)))
+ allDatesRUN <- colnames(dwRun3[IndexColumnsRUN])
+ # Ensure that you have the same amount of dates in this as you do the loginInfo7 
+ length(allDates) == length(allDatesRUN)
+ 
+ ### remove anyone that does not have a valid start date; this is a user not listed in loginInfo7
+ ## likely because they were removed for not having enough data dat %>% drop_na("B")
+ #allDatesRUN <- allDatesRUN %>% drop_na("firstlogindate")
+ dwRun3 <- dwRun3 %>% drop_na("firstlogindate")  
+ 
+ # adds 'startvec' to the data frame to tell what column to index into for first login
+ for (i in 1:length(dwRun3$userID)){
+      dwRun3$startvec[i] <- which(allDatesRUN == dwRun3$firstlogindate[i])# for user in each row
+      dwRun3$lastdatevec[i] <- length(allDatesRUN)
+ }
+
+  # gives the column for the last date in the trial period 
+dwRun3$endvec <- dwRun3$startvec + 6
+dwRun3$startcol <- IndexColumnsRUN[dwRun3$startvec]
+dwRun3$endcol <- IndexColumnsRUN[dwRun3$endvec]
+dwRun3$lastdatecol <- IndexColumnsRUN[dwRun3$lastdatevec]
+
+# gives the number of total runs logged ins for the user's first week
+# also gives the number of active run days for the user's first week
+# contains info for runs following week 1 as well to help indicate churn
+for (i in 1:length(dwRun3$firstlogindate)){
+  myrows <- dwRun3$startcol[i]:dwRun3$endcol[i]
+  postwk1rows <- (dwRun3$endcol[i]+1):(dwRun3$lastdatecol[i])
+  dwRun3$NumfirstWeekRuns[i] <- sum(dwRun3[i, myrows])
+  dwRun3$NumPostwk1Runs[i] = sum(dwRun3[i, postwk1rows])
+} 
+  
+### ADD NumfirstWeekRuns and Numpostwk1Runs to loginInfo7
+tempdf <- data.frame("userID"=dwRun3$userID, "NumPostwk1Runs"=dwRun3$NumPostwk1Runs, "NumfirstWeekRuns" = dwRun3$NumfirstWeekRuns)
+loginInfo7 <-  left_join(loginInfo7, tempdf, by = "userID")
+
+```
+
+FEATURE #3: Number of tracks that the user enrolled in during week 1
+```{r}
+## Looking at track enrollment information
+trackEnrollment2 <- data.frame("userID" = trackEnrollment$user, "track" = trackEnrollment$track, "date" = as.Date(trackEnrollment$createdAt))
+trackEnrollment2$enrollOccur <- 1
+
+## Limit to instances between the dates of interest
+trackEnrollment2 <- trackEnrollment2[which(trackEnrollment2$date >= firstdate & trackEnrollment2$date <= lastdate),]
+
+#### Create data frame with count of logins by date for each unique user for enrollment
+# this is taking the dates from ALL available; not just enrollment dates
+  temptableTE <- count(trackEnrollment2, userID, date) # gives count for each available date per user
+  temptableTE$date <- as.Date(as.character(temptableTE$date))
+  trackEnrollment2 <- dcast(temptableTE, userID ~ date)
+  # find any dates that are available logins but did NOT have any user enrollments; if no dates, comment out
+    #diffColnames <- setdiff(colnames(loginInfo7), colnames(trackEnrollment2))
+    #indexTEaddDate <- diffColnames[which(grepl("20", diffColnames))]
+    #trackEnrollment2$placeholder <- 0
+  # rename any additional date --> will need to update if more than one date
+    #names(trackEnrollment2)[names(trackEnrollment2) == "placeholder"] <- indexTEaddDate
+  trackEnrollment2 <- trackEnrollment2[,order(colnames(trackEnrollment2), decreasing=FALSE)] 
+  trackEnrollment2[is.na(trackEnrollment2)] <- 0
+  
+ # Add first login date from loginInfo7 so that we can calculate the num sessions enrolled in wk1
+ tempdf <- data.frame("userID"=loginInfo7$userID, "firstlogindate"=as.character(as.Date(loginInfo7$firstlogindate)))
+ trackEnrollment3 <-  left_join(trackEnrollment2, tempdf, by = "userID")
+ 
+ # create a vector that gives the column index for any column name that begins with "20" for "2019-01-01"
+ IndexColumnsTE <- which(grepl("20", colnames(trackEnrollment3)))
+ allDatesTE <- colnames(trackEnrollment3[IndexColumnsTE])
+ # Ensure that you have the same amount of dates in this as you do the loginInfo7 
+ length(allDates) == length(allDatesTE)
+ 
+ ### remove anyone that does not have a valid start date; this is a user not listed in loginInfo7
+ ## likely because they were removed for not having enough data dat %>% drop_na("B")
+ trackEnrollment3 <- trackEnrollment3 %>% drop_na("firstlogindate")
+
+ # adds 'startvec' to the data frame to tell what column to index into for first login
+ for (i in 1:length(trackEnrollment3$userID)){
+      trackEnrollment3$startvec[i] <- which(allDatesTE == trackEnrollment3$firstlogindate[i])# for user in each row
+      trackEnrollment3$lastdatevec[i] <- length(allDatesTE)
+ }
+
+  # gives the column for the last date in the trial period 
+trackEnrollment3$endvec <- trackEnrollment3$startvec + 6
+trackEnrollment3$startcol <- IndexColumnsTE[trackEnrollment3$startvec]
+trackEnrollment3$endcol <- IndexColumnsTE[trackEnrollment3$endvec]
+trackEnrollment3$lastdatecol <- IndexColumnsTE[trackEnrollment3$lastdatevec]
+
+# gives the number of total login ins for the user's first week
+# also gives the number of active days for the user's first week
+# contains info for logins following week 1 as well to help indicate churn
+for (i in 1:length(trackEnrollment3$firstlogindate)){
+  myrows <- trackEnrollment3$startcol[i]:trackEnrollment3$endcol[i]
+  postwk1rows <- (trackEnrollment3$endcol[i]+1):(trackEnrollment3$lastdatecol[i])
+  trackEnrollment3$NumfirstWeekEnroll[i] <- sum(trackEnrollment3[i, myrows])
+  trackEnrollment3$NumPostwk1Enroll[i] = sum(trackEnrollment3[i, postwk1rows])
+} 
+
+### ADD NumfirstWeekEnroll and Numpostwk1Enroll to loginInfo7
+tempdf <- data.frame("userID"=trackEnrollment3$userID, "NumPostwk1Enroll"=trackEnrollment3$NumPostwk1Enroll, "NumfirstWeekEnroll" = trackEnrollment3$NumfirstWeekEnroll)
+loginInfo7 <-  left_join(loginInfo7, tempdf, by = "userID")
+
+```
+
+FEATURE #4: Engineers the number of Sessions that were COMPLETED by a user during week 1
+```{r}
+#### Gives information for each session completed by users
+trackSessionComplete2 <- data.frame("userID" = trackSessionComplete$user, "track" = trackSessionComplete$track, "trackTitle" = trackSessionComplete$trackTitle, "session" = trackSessionComplete$trackSession, 'sessionTitle' = trackSessionComplete$sessionTitle, "date" = as.Date(trackSessionComplete$createdAt))
+
+# limit between dates of interest
+trackSessionComplete2 <- trackSessionComplete2[which(trackSessionComplete2$date >= firstdate & trackSessionComplete2$date <= lastdate),]
+trackSessionComplete2$completeOccur <- 1
+
+#### Create data frame with count of logins by date for each unique user for enrollment
+# this is taking the dates from ALL available; not just enrollment dates
+  temptableTS <- count(trackSessionComplete2, userID, date) # gives count for each available date per user
+  temptableTS$date <- as.Date(as.character(temptableTS$date))
+  trackSessionComplete2 <- dcast(temptableTS, userID ~ date)
+  # find any dates that are available logins but did NOT have any completed sessions
+  diffColnames2 <- setdiff(colnames(loginInfo7), colnames(trackEnrollment2))
+    #indexTSaddDate <- diffColnames2[which(grepl("20", diffColnames2))]
+    #trackSessionComplete2$placeholder <- 0
+    #names(trackSessionComplete2)[names(trackSessionComplete2) == "placeholder"] <- indexTSaddDate
+  trackSessionComplete2 <- trackSessionComplete2[,order(colnames(trackSessionComplete2), decreasing=FALSE)] 
+  trackSessionComplete2[is.na(trackSessionComplete2)] <- 0
+  
+ # Add first login date from loginInfo7 so that we can calculate the num sessions completed in wk1
+ tempdf <- data.frame("userID"=loginInfo7$userID, "firstlogindate"=as.character(as.Date(loginInfo7$firstlogindate)))
+ trackSessionComplete2 <-  left_join(trackSessionComplete2, tempdf, by = "userID")
+ 
+ # create a vector that gives the column index for any column name that begins with "20" for "2019-01-01"
+ IndexColumnsTS <- which(grepl("20", colnames(trackSessionComplete2)))
+ allDatesTS <- colnames(trackSessionComplete2[IndexColumnsTS])
+ # Ensure that you have the same amount of dates in this as you do the loginInfo7 
+ length(allDates) == length(allDatesTS)
+ 
+ ### remove anyone that does not have a valid start date; this is a user not listed in loginInfo7
+ ## likely because they were removed for not having enough data dat %>% drop_na("B")
+ trackSessionComplete3 <- trackSessionComplete2 %>% drop_na("firstlogindate")
+ 
+ # adds 'startvec' to the data frame to tell what column to index into for first login
+ for (i in 1:length(trackSessionComplete3$userID)){
+      trackSessionComplete3$startvec[i] <- which(allDatesTS == trackSessionComplete3$firstlogindate[i])# for user in each row
+      trackSessionComplete3$lastdatevec[i] <- length(allDatesTS)
+ }
+
+  # gives the column for the last date in the trial period 
+trackSessionComplete3$endvec <- trackSessionComplete3$startvec + 6
+trackSessionComplete3$startcol <- IndexColumnsTS[trackSessionComplete3$startvec]
+trackSessionComplete3$endcol <- IndexColumnsTS[trackSessionComplete3$endvec]
+trackSessionComplete3$lastdatecol <- IndexColumnsTS[trackSessionComplete3$lastdatevec]
+
+# gives the number of total login ins for the user's first week
+# also gives the number of active days for the user's first week
+# contains info for logins following week 1 as well to help indicate churn
+for (i in 1:length(trackSessionComplete3$firstlogindate)){
+  myrows <- trackSessionComplete3$startcol[i]:trackSessionComplete3$endcol[i]
+  postwk1rows <- (trackSessionComplete3$endcol[i]+1):(trackSessionComplete3$lastdatecol[i])
+  trackSessionComplete3$NumfirstWeekSess[i] <- sum(trackSessionComplete3[i, myrows])
+  trackSessionComplete3$NumPostwk1Sess[i] = sum(trackSessionComplete3[i, postwk1rows])
+} 
+
+### ADD NumfirstWeekEnroll and Numpostwk1runs to loginInfo7
+tempdf <- data.frame("userID"=trackSessionComplete3$userID, "NumPostwk1Sess"=trackSessionComplete3$NumPostwk1Sess, "NumfirstWeekSess" = trackSessionComplete3$NumfirstWeekSess)
+loginInfo7 <-  left_join(loginInfo7, tempdf, by = "userID")
+
+```
+
+FEATURE #5: Engineering the number of social/community interactions during week 1. 
+This includes likes, comments, news story posts, upvotes
+```{r}
+## Include any social media posts [question, question upvote, answer, answer upvote, newsfeedstory, newsfeedstory comment, newsfeedstorylike]
+profTimelineitem2 <- data.frame("userID" = profTimelineitem$user, "objType" = profTimelineitem$objType, "date" = as.Date(profTimelineitem$createdAt))
+# limit between time periods of interest
+profTimelineitem2 <- profTimelineitem2[which(profTimelineitem2$date >= firstdate & profTimelineitem2$date <= lastdate),]
+profTimelineitem2$socialmedia <- 1
+
+## Separate out comments/questions/answers from upvotes/likes
+# remove tracksessioncomplete, trackcomplete, dataworkoutrun from profTimelineitem
+remove.list <- paste(c("TrackSessionComplete", "TrackComplete", "DataWorkoutRun"), collapse = '|')
+profTimelineitem3 <- profTimelineitem2 %>% filter(!grepl(remove.list, objType)) 
+
+#### Create data frame with count of logins by date for each unique user for social media engagement
+# this is taking the dates from ALL available; not just SM dates
+  temptableSM <- count(profTimelineitem2, userID, date) # gives count for each available date per user
+  temptableSM$date <- as.Date(as.character(temptableSM$date))
+  profTimelineitem3 <- dcast(temptableSM, userID ~ date)
+  # find any dates that are available logins but did NOT have any social media engagement
+  diffColnames2 <- setdiff(colnames(loginInfo7), colnames(profTimelineitem3))
+    #indexSMaddDate <- diffColnames2[which(grepl("20", diffColnames2))]
+    #profTimelineitem3$placeholder <- 0
+  # rename any additional date --> will need to update if more than one date
+  # Is not required for social media engagement dates
+    #names(profTimelineitem3)[names(profTimelineitem3) == "placeholder"] <- indexSMaddDate
+  profTimelineitem3 <- profTimelineitem3[,order(colnames(profTimelineitem3), decreasing=FALSE)] 
+  profTimelineitem3[is.na(profTimelineitem3)] <- 0
+  
+ # Add first login date from loginInfo7 so that we can calculate the num sessions completed in wk1
+ tempdf <- data.frame("userID"=loginInfo7$userID, "firstlogindate"=as.character(as.Date(loginInfo7$firstlogindate)))
+ profTimelineitem3 <-  left_join(profTimelineitem3, tempdf, by = "userID")
+ 
+ # create a vector that gives the column index for any column name that begins with "20" for "2019-01-01"
+ IndexColumnsSM <- which(grepl("20", colnames(profTimelineitem3)))
+ allDatesSM <- colnames(profTimelineitem3[IndexColumnsSM])
+ # Ensure that you have the same amount of dates in this as you do the loginInfo7 
+ length(allDates) == length(allDatesSM)
+ 
+ ### remove anyone that does not have a valid start date; this is a user not listed in loginInfo7
+ ## likely because they were removed for not having enough data dat %>% drop_na("B")
+ profTimelineitem3 <- profTimelineitem3 %>% drop_na("firstlogindate")
+ 
+# adds 'startvec' to the data frame to tell what column to index into for first login
+ for (i in 1:length(profTimelineitem3$userID)){
+      profTimelineitem3$startvec[i] <- which(allDatesSM == profTimelineitem3$firstlogindate[i])# for user in each row
+      profTimelineitem3$lastdatevec[i] <- length(allDatesSM)
+ }
+
+  # gives the column for the last date in the trial period 
+profTimelineitem3$endvec <- profTimelineitem3$startvec + 6
+profTimelineitem3$startcol <- IndexColumnsSM[profTimelineitem3$startvec]
+profTimelineitem3$endcol <- IndexColumnsSM[profTimelineitem3$endvec]
+profTimelineitem3$lastdatecol <- IndexColumnsSM[profTimelineitem3$lastdatevec]
+
+# gives the number of total login ins for the user's first week
+# also gives the number of active days for the user's first week
+# contains info for logins following week 1 as well to help indicate churn
+for (i in 1:length(profTimelineitem3$firstlogindate)){
+  myrows <- profTimelineitem3$startcol[i]:profTimelineitem3$endcol[i]
+  postwk1rows <- (profTimelineitem3$endcol[i]+1):(profTimelineitem3$lastdatecol[i])
+  profTimelineitem3$NumfirstWeekSM[i] <- sum(profTimelineitem3[i, myrows])
+  profTimelineitem3$NumPostwk1SM[i] = sum(profTimelineitem3[i, postwk1rows])
+} 
+
+### ADD NumfirstWeekSM and Numpostwk1SM to loginInfo7
+tempdf <- data.frame("userID"=profTimelineitem3$userID, "NumPostwk1SM"=profTimelineitem3$NumPostwk1SM, "NumfirstWeekSM" = profTimelineitem3$NumfirstWeekSM)
+loginInfo7 <-  left_join(loginInfo7, tempdf, by = "userID")
+
+```
+
+FEATURE #6: Active logins during week 1.
+This is also used to binarize active churn for model # 2. 
+```{r}
+## Look at ANY ACTIVITY at all pre/post week 1 for active logging so that I can 
+## Identify chuners as someone who did any meaningful activity post wk 1
+activeLogins <- data.frame("userID" = profTimelineitem$user, "objType" = profTimelineitem$objType, "date" = as.Date(profTimelineitem$createdAt))
+
+# limit between time periods of interest
+activeLogins <- activeLogins[which(activeLogins$date >= firstdate & activeLogins$date <= lastdate),]
+activeLogins$activeLogin <- 1
+
+#### Create data frame with count of logins by date for each unique user for all active logins
+# this is taking the dates from ALL available
+  temptableAL <- count(activeLogins, userID, date) # gives count for each available date per user
+  temptableAL$date <- as.Date(as.character(temptableAL$date))
+  activeLogins2 <- dcast(temptableAL, userID ~ date)
+  # find any dates that are available logins but did NOT have any active logins
+  diffColnames2 <- setdiff(colnames(loginInfo7), colnames(activeLogins2))
+  
+  # rename any additional date --> will need to update if more than one date
+  activeLogins2 <- activeLogins2[,order(colnames(activeLogins2), decreasing=FALSE)] 
+  activeLogins2[is.na(activeLogins2)] <- 0
+  
+ # Add first login date from loginInfo7 so that we can calculate the active logins in wk 1
+ tempdf <- data.frame("userID"=loginInfo7$userID, "firstlogindate"=as.character(as.Date(loginInfo7$firstlogindate)))
+ activeLogins2 <-  left_join(activeLogins2, tempdf, by = "userID")
+ 
+ # create a vector that gives the column index for any column name that begins with "20" for "2019-01-01"
+ IndexColumnsAL <- which(grepl("20", colnames(activeLogins2)))
+ allDatesAL <- colnames(activeLogins2[IndexColumnsAL])
+ # Ensure that you have the same amount of dates in this as you do the loginInfo7 
+ length(allDates) == length(allDatesAL)
+ 
+ ### remove anyone that does not have a valid start date; this is a user not listed in loginInfo7
+ ## likely because they were removed for not having enough data dat %>% drop_na("B")
+ activeLogins2 <- activeLogins2 %>% drop_na("firstlogindate")
+
+# adds 'startvec' to the data frame to tell what column to index into for first login
+ for (i in 1:length(activeLogins2$userID)){
+      activeLogins2$startvec[i] <- which(allDatesAL == activeLogins2$firstlogindate[i])# for user in each row
+      activeLogins2$lastdatevec[i] <- length(allDatesAL)
+ }
+
+  # gives the column for the last date in the trial period 
+activeLogins2$endvec <- activeLogins2$startvec + 6
+activeLogins2$startcol <- IndexColumnsAL[activeLogins2$startvec]
+activeLogins2$endcol <- IndexColumnsAL[activeLogins2$endvec]
+activeLogins2$lastdatecol <- IndexColumnsAL[activeLogins2$lastdatevec]
+
+# gives the number of total login ins for the user's first week
+# also gives the number of active days for the user's first week
+# contains info for logins following week 1 as well to help indicate churn
+for (i in 1:length(activeLogins2$firstlogindate)){
+  myrows <- activeLogins2$startcol[i]:activeLogins2$endcol[i]
+  postwk1rows <- (activeLogins2$endcol[i]+1):(activeLogins2$lastdatecol[i])
+  activeLogins2$NumfirstWeekAL[i] <- sum(activeLogins2[i, myrows])
+  activeLogins2$NumPostwk1AL[i] = sum(activeLogins2[i, postwk1rows])
+} 
+
+
+##====================================================================================
+#  DEFINE CHURN AND ACTIVE CHURN
+##====================================================================================
+# Define churners as those that had ZERO active login days post wk 1 (churners=1, those with >1 AL = 0)
+churnAL <- which(activeLogins2$NumPostwk1AL == 0) # index for churners
+activeAL <- which(activeLogins2$NumPostwk1AL != 0) # index for churners
+  
+activeLogins2$churnAL <- 0
+activeLogins2$churnAL[churnAL] <- 1  #index to which had activity
+
+### ADD NumfirstWeekSM and Numpostwk1SM to loginInfo7
+tempdf <- data.frame("userID"=profTimelineitem3$userID, "NumfirstWeekAL"=activeLogins2$NumfirstWeekAL, "NumfPostwk1AL" = activeLogins2$NumPostwk1AL, "churnAL" = activeLogins2$churnAL)
+loginInfo7 <-  left_join(loginInfo7, tempdf, by = "userID")
+
+## Add together total number of active sessions
+loginInfo7$totalActiveLogins <- loginInfo7$NumfirstWeekAL + loginInfo7$NumfPostwk1AL
+```
+
+
+FEATURE #7: Subscription plan
+Although at date of writing, this is unlikely to be an important feature in the model because there are low number of subscribers, BUT this is likely an important feature as more users become subscribers.
+Additionally, the company can also use this as an outcome in the future to predict and define churn at this higher level. 
+```{r}
+## Introduce subscription plan information
+subscriptionPlan2 <- data.frame("planNum" = subscriptionPlan$X_id, "plan" = subscriptionPlan$name, "planMonths" = subscriptionPlan$durationInMonths)
+
+# can also include purchase date if interested
+subscription2 <- data.frame("userID" = subscription$user, "planNum" = subscription$plan, "userType" = as.character("premium"))
+
+length(which(subscription2$planNum==subscriptionPlan2$planNum[1])) # number of monthly plans
+length(which(subscription2$planNum==subscriptionPlan2$planNum[2])) # number of annual plans
+
+# add in which plan type 
+monthlyPlans<- (which(subscription2$planNum==subscriptionPlan2$planNum[1])) # monthly plans
+annualPlans <- (which(subscription2$planNum==subscriptionPlan2$planNum[2])) # annual plans
+subscription2$planType <- ('')
+subscription2$planType[monthlyPlans] <- as.character("monthly")
+subscription2$planType[annualPlans] <- as.character("annual")
+subscription2$planType <- as.factor(subscription2$planType)
+subscription2$userType <- as.factor(subscription2$userType)
+
+loginInfo7 <-  left_join(loginInfo7, subscription2, by = "userID")
+
+#check levels
+levels(loginInfo7$userType)
+levels(loginInfo7$planType)
+
+#add new factor level. i.e "free" or "none"
+loginInfo7$userType <- factor(loginInfo7$userType, levels=c(levels(loginInfo7$userType), "free"))
+loginInfo7$planType <- factor(loginInfo7$planType, levels=c(levels(loginInfo7$planType), "none"))
+
+#convert all NA's to free or none
+loginInfo7$userType[is.na(loginInfo7$userType)] <- "free"
+loginInfo7$planType[is.na(loginInfo7$planType)] <- "none"
+
+```
+
+Final engineering of information into dataset to be written to .csv and imported into python for modeling
+```{r}
+### Binarize gender (0 = female, 1 = Male, else NA)
+loginInfo7$sex <- NA
+males <- which(loginInfo7$gender=="male")
+females <- which(loginInfo7$gender=="female")
+loginInfo7$sex[males] <- 1
+loginInfo7$sex[females] <- 0
+
+# ensure that churn is correctly measured
+# Define churners as those that had more than 2 logins post week 1
+churn <- which(loginInfo7$NumPostwk1Logins <= 1) # index for churners
+loginInfo7$churn <- 0
+loginInfo7$churn[churn] <- 1  #index to which had activity
+
+
+
+# create data frame to export
+modeldf <- data.frame("userID" = loginInfo7$userID, "dayswithApp" = loginInfo7$dayswithAppNumeric, "Wk1ActiveDays" = loginInfo7$Wk1ActiveDays, "NumfirstWeeklogins" = loginInfo7$NumfirstWeeklogins, "NumfirstWeekRuns" = loginInfo7$NumfirstWeekRuns, "NumfirstWeekSess" = loginInfo7$NumfirstWeekSess, "NumfirstWeekEnroll" = loginInfo7$NumfirstWeekEnroll, "NumfirstWeekSM" = loginInfo7$NumfirstWeekSM, "NumfirstWeekAL" = loginInfo7$NumfirstWeekAL, "planType" = loginInfo7$planType, "userType" = loginInfo7$userType, "churn" = loginInfo7$churn, "churnAL" = loginInfo7$churnAL, stringsAsFactors = TRUE)
+
+# Replace any NA values with 0
+modeldf$NumfirstWeekEnroll <- modeldf$NumfirstWeekEnroll%>% replace_na(0)
+modeldf$NumfirstWeekRuns <- modeldf$NumfirstWeekRuns%>% replace_na(0)
+modeldf$NumfirstWeekSess <- modeldf$NumfirstWeekSess%>% replace_na(0)
+modeldf$NumfirstWeekSM <- modeldf$NumfirstWeekSM%>% replace_na(0)
+modeldf$NumfirstWeekAL <- modeldf$NumfirstWeekAL%>% replace_na(0)
+# churn measure, if they had more than 1 login in post week 1
+# second churn measure, if they did not have an active login, replace na with 1 (they churned)
+modeldf$churnAL <- modeldf$churnAL%>% replace_na(1)
+
+modeldf$userTypeNumeric <- 0
+modeldf$userTypeNumeric[which(modeldf$userType =="premium")] <- 1
+
+ # Remove individuals that logged in >99 times **These are the coaches
+ modeldf2 <- modeldf[which(modeldf$NumfirstWeeklogins < 100),]
+
+ ### Creating a new churn for y
+ ## ACTIVE, engaged users = 0, passive logins = 1, churners = 2
+ modeldf2$churnlevels <- as.factor(modeldf2$churn + modeldf2$churnAL)
+
+ # get the count for each level of churn
+  modeldf2 %>% group_by(churnAL) %>% tally()
+ modeldf2 %>% group_by(churn) %>% tally()
+ modeldf2 %>% group_by(churnlevels) %>% tally()
+
+ # the following csv file is what will be read into the python script for random forest modeling
+#write.csv(modeldf2, "modeldf_updatedmultiChurn.csv")
+
+ # Individuals that had SOME engagement with the app based on 'non churners'
+#wk1active <- modeldf2[which(modeldf2$NumfirstWeekAL>=1),]
+#write.csv(wk1active, "wk1activeONLY.csv")
+```
